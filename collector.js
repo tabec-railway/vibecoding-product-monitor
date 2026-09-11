@@ -23,12 +23,24 @@ function productUrls(categoryHtml) {
   const products = hits.map(([,url,id])=>({id, url:absolute(url)}));
   return [...new Map(products.map(x=>[x.id,x])).values()];
 }
+function categoryPhotoMap(html) {
+  const photos=[...html.matchAll(/<div class=["']thumbnail["']>\s*<a[^>]+href=["'][^"']*\/product\/[^"']+?\/(\d+)\/[^"']*["'][^>]*>\s*<img src=["']([^"']+)["']/gi)]
+    .map(([,id,image])=>[id,absolute(image)])
+    .filter(([,image])=>image&&/ecimg\.cafe24img\.com/i.test(image));
+  return new Map(photos);
+}
+async function listedPhotoMap() {
+  const categoryNumbers=Array.from({length:31},(_,index)=>index+50);
+  const pages=await Promise.all(categoryNumbers.map(async number=>{try{return await fetchPage(`${ORIGIN}/product/list.html?cate_no=${number}`);}catch{return '';}));
+  return new Map(pages.flatMap(page=>[...categoryPhotoMap(page)]));
+}
 function extractDetail(html, category, fallback) {
   const id = /\/product\/[^/]+\/(\d+)/.exec(fallback.url)?.[1] ?? fallback.id;
   const rawTitle=attribute(html,'og:title') ?? '';
   const name=decode(rawTitle.replace(/\s*-\s*바이브코딩대학\s*$/,'').trim()) || `상품 ${id}`;
   const price=Number((attribute(html,'product:price:amount') ?? '0').replace(/[^0-9]/g,'')) || null;
-  const image=absolute(attribute(html,'og:image') ?? html.match(/<img[^>]+src=["']([^"']+)["'][^>]*>/i)?.[1]);
+  const detailImage=absolute(attribute(html,'og:image') ?? html.match(/<img[^>]+src=["']([^"']+)["'][^>]*>/i)?.[1]);
+  const image=fallback.image ?? (detailImage&&!/\/SkinImg\/img\/ico_/i.test(detailImage)?detailImage:null);
   const area=html.match(/<div\b[^>]*id=["']prdDetail["'][^>]*>([\s\S]*?)<\/div>\s*<\/div>/i)?.[1] ?? '';
   const description=text(area).slice(0,2000) || null;
   // Cafe24 keeps a hidden "품절" button in every template, so only trust its product-state variables.
@@ -46,6 +58,9 @@ export async function collect(onProgress=()=>{}) {
       onProgress({stage:'category',category:category.name});
       const list=await fetchPage(category.url); for (const item of productUrls(list)) unique.set(item.id,{...item,category:category.name}); await delay(250);
     }
+    // 실제 상품 사진은 상세 페이지가 아니라 하위 카테고리 카드에 제공됩니다.
+    const photos=await listedPhotoMap();
+    for (const [id,image] of photos) { const existing=unique.get(id); if (existing) unique.set(id,{...existing,image}); }
     const items=[...unique.values()];
     // 서버리스 실행 제한 안에서 끝나도록 소규모 병렬 수집을 사용합니다.
     const concurrency=5; let cursor=0;
@@ -62,6 +77,83 @@ export async function collect(onProgress=()=>{}) {
     await markInactive(seen); const result={status:'success',scanned,added,changed}; await endRun(runId,result); return result;
   } catch(error) { const result={status:'failed',scanned,added,changed,error:error.message}; await endRun(runId,result); throw error; }
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
