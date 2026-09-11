@@ -1,6 +1,15 @@
 {
   "version": 2,
-  "builds": [{ "src": "api.js", "use": "@vercel/node" }],
-  "routes": [{ "src": "/api/(.*)", "dest": "/api.js" }],
+  "builds": [
+    { "src": "api.js", "use": "@vercel/node" },
+    { "src": "index.html", "use": "@vercel/static" },
+    { "src": "style.css", "use": "@vercel/static" },
+    { "src": "app.js", "use": "@vercel/static" }
+  ],
+  "routes": [
+    { "src": "/api/(.*)", "dest": "/api.js" },
+    { "handle": "filesystem" },
+    { "src": "/", "dest": "/index.html" }
+  ],
   "crons": [{ "path": "/api/collect", "schedule": "0 15 * * *" }]
 }
