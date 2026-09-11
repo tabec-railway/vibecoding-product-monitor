@@ -47,12 +47,80 @@ export async function collect(onProgress=()=>{}) {
       const list=await fetchPage(category.url); for (const item of productUrls(list)) unique.set(item.id,{...item,category:category.name}); await delay(250);
     }
     const items=[...unique.values()];
-    for (const item of items) {
-      scanned++; onProgress({stage:'product',scanned,total:items.length,name:item.id});
-      try { const status=await upsertProduct(extractDetail(await fetchPage(item.url),item.category,item)); if(status==='added')added++; if(status==='changed')changed++; seen.push(item.id); }
-      catch(error) { console.error('상품 수집 실패', item.url, error.message); }
-      await delay(200);
+    // 서버리스 실행 제한 안에서 끝나도록 소규모 병렬 수집을 사용합니다.
+    const concurrency=5; let cursor=0;
+    async function worker() {
+      while (true) {
+        const index=cursor++; if (index>=items.length) return;
+        const item=items[index]; scanned++; onProgress({stage:'product',scanned,total:items.length,name:item.id});
+        try { const status=await upsertProduct(extractDetail(await fetchPage(item.url),item.category,item)); if(status==='added')added++; if(status==='changed')changed++; seen.push(item.id); }
+        catch(error) { console.error('상품 수집 실패', item.url, error.message); }
+        await delay(50);
+      }
     }
+    await Promise.all(Array.from({length:Math.min(concurrency,items.length)},worker));
     await markInactive(seen); const result={status:'success',scanned,added,changed}; await endRun(runId,result); return result;
   } catch(error) { const result={status:'failed',scanned,added,changed,error:error.message}; await endRun(runId,result); throw error; }
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
