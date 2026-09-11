@@ -1,6 +1,7 @@
 import { init, startRun, endRun, upsertProduct, markInactive, close } from './store.js';
 
 export const ORIGIN = 'https://vibecodinguniv.cafe24.com';
+// Category-card photographs are refreshed on every collection.
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 const decode = value => value.replaceAll('&amp;', '&').replaceAll('&#39;', "'").replaceAll('&quot;', '"').replace(/&#(\d+);/g, (_,n)=>String.fromCharCode(Number(n)));
 const text = html => decode(html.replace(/<script[\s\S]*?<\/script>|<style[\s\S]*?<\/style>/gi,'').replace(/<[^>]*>/g,' ').replace(/\s+/g,' ').trim());
@@ -77,6 +78,7 @@ export async function collect(onProgress=()=>{}) {
     await markInactive(seen); const result={status:'success',scanned,added,changed}; await endRun(runId,result); return result;
   } catch(error) { const result={status:'failed',scanned,added,changed,error:error.message}; await endRun(runId,result); throw error; }
 }
+
 
 
 
