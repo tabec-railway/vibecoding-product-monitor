@@ -3,78 +3,47 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
-const file = path.join(root, 'data', 'products.json');
-let pool;
-let local;
+const dataDir = process.env.DATA_DIR || path.join(root, 'data');
+const dbFile = path.join(dataDir, 'products.json');
+const csvFile = path.join(dataDir, 'product.csv');
+let pool; let local;
+const now = () => new Date().toISOString();
+const fields = ['name','url','image','category','listPrice','salePrice','soldOut','reviewCount','rating','description','lifecycleStatus'];
+const equal = (a,b) => fields.every(k => (a?.[k] ?? null) === (b?.[k] ?? null));
+const priceChanged = (a,b) => (a?.salePrice ?? null) !== (b?.salePrice ?? null) || (a?.listPrice ?? null) !== (b?.listPrice ?? null);
+const csv = v => `"${String(v ?? '').replaceAll('"','""')}"`;
+function statusOf(p) { return !p.active ? 'deleted' : p.soldOut ? 'sold_out' : 'active'; }
+function normalize(row) { if (!row) return row; return {...row, listPrice:row.listPrice ?? row.list_price ?? null, salePrice:row.salePrice ?? row.sale_price ?? row.price ?? null, reviewCount:row.reviewCount ?? row.review_count ?? null, rating:row.rating == null ? null : Number(row.rating), soldOut:row.soldOut ?? row.sold_out ?? false, lifecycleStatus:row.lifecycleStatus ?? row.lifecycle_status ?? statusOf(row), firstSeenAt:row.firstSeenAt ?? row.first_seen_at, lastSeenAt:row.lastSeenAt ?? row.last_seen_at, updatedAt:row.updatedAt ?? row.updated_at}; }
+async function getLocal(){ if(local) return local; try { local=JSON.parse(await fs.readFile(dbFile,'utf8')); } catch { local={products:[],history:[],snapshots:[],runs:[],reviews:[]}; } local.snapshots ??=[]; local.reviews ??=[]; return local; }
+async function saveLocal(){ await fs.mkdir(dataDir,{recursive:true}); await fs.writeFile(dbFile,JSON.stringify(local,null,2)); }
 
-async function getLocal() {
-  if (local) return local;
-  try { local = JSON.parse(await fs.readFile(file, 'utf8')); }
-  catch { local = { products: [], history: [], runs: [] }; }
-  return local;
+export async function init(){
+  if (!process.env.DATABASE_URL) return getLocal();
+  if (pool) return;
+  const { Pool } = await import('pg'); pool = new Pool({connectionString:process.env.DATABASE_URL,ssl:process.env.DATABASE_URL.includes('localhost')?false:{rejectUnauthorized:false}});
+  await pool.query(`CREATE TABLE IF NOT EXISTS crawl_runs (id BIGSERIAL PRIMARY KEY, started_at TIMESTAMPTZ DEFAULT NOW(), finished_at TIMESTAMPTZ, status TEXT, scanned_count INTEGER DEFAULT 0, new_count INTEGER DEFAULT 0, changed_count INTEGER DEFAULT 0, error_message TEXT, trigger TEXT DEFAULT 'manual');
+  CREATE TABLE IF NOT EXISTS products (id TEXT PRIMARY KEY,name TEXT NOT NULL,url TEXT NOT NULL,image TEXT,category TEXT,price INTEGER,list_price INTEGER,sale_price INTEGER,sold_out BOOLEAN DEFAULT FALSE,review_count INTEGER,rating NUMERIC(3,2),description TEXT,active BOOLEAN DEFAULT TRUE,lifecycle_status TEXT DEFAULT 'active',first_seen_at TIMESTAMPTZ DEFAULT NOW(),last_seen_at TIMESTAMPTZ DEFAULT NOW(),updated_at TIMESTAMPTZ DEFAULT NOW());
+  CREATE TABLE IF NOT EXISTS product_history (id BIGSERIAL PRIMARY KEY,product_id TEXT REFERENCES products(id) ON DELETE CASCADE,event_type TEXT NOT NULL,before_data JSONB,after_data JSONB,created_at TIMESTAMPTZ DEFAULT NOW());
+  CREATE TABLE IF NOT EXISTS product_snapshots (id BIGSERIAL PRIMARY KEY,product_id TEXT REFERENCES products(id) ON DELETE CASCADE,crawl_run_id BIGINT REFERENCES crawl_runs(id) ON DELETE SET NULL,observed_at TIMESTAMPTZ DEFAULT NOW(),name TEXT NOT NULL,category TEXT,list_price INTEGER,sale_price INTEGER,sold_out BOOLEAN,review_count INTEGER,rating NUMERIC(3,2),lifecycle_status TEXT NOT NULL);
+  CREATE TABLE IF NOT EXISTS product_reviews (review_no TEXT PRIMARY KEY,product_id TEXT REFERENCES products(id) ON DELETE CASCADE,writer TEXT,rating NUMERIC(3,2),content TEXT,created_at TIMESTAMPTZ,helpful_count INTEGER);
+  ALTER TABLE products ADD COLUMN IF NOT EXISTS list_price INTEGER; ALTER TABLE products ADD COLUMN IF NOT EXISTS review_count INTEGER; ALTER TABLE products ADD COLUMN IF NOT EXISTS rating NUMERIC(3,2); ALTER TABLE products ADD COLUMN IF NOT EXISTS lifecycle_status TEXT DEFAULT 'active'; ALTER TABLE crawl_runs ADD COLUMN IF NOT EXISTS trigger TEXT DEFAULT 'manual';
+  CREATE INDEX IF NOT EXISTS product_snapshots_time ON product_snapshots(product_id,observed_at DESC);`);
 }
-async function saveLocal() {
-  await fs.mkdir(path.dirname(file), { recursive: true });
-  await fs.writeFile(file, JSON.stringify(local, null, 2));
+export async function startRun(trigger='manual'){ await init(); if(pool) return (await pool.query(`INSERT INTO crawl_runs(status,trigger) VALUES('running',$1) RETURNING id`,[trigger])).rows[0].id; const d=await getLocal(); const run={id:Date.now(),startedAt:now(),status:'running',trigger,scannedCount:0,newCount:0,changedCount:0}; d.runs.unshift(run); await saveLocal(); return run.id; }
+export async function endRun(id,result){ if(pool){await pool.query(`UPDATE crawl_runs SET finished_at=NOW(),status=$2,scanned_count=$3,new_count=$4,changed_count=$5,error_message=$6 WHERE id=$1`,[id,result.status,result.scanned,result.added,result.changed,result.error??null]);return;} const d=await getLocal(); Object.assign(d.runs.find(r=>r.id===id),{...result,finishedAt:now(),scannedCount:result.scanned,newCount:result.added,changedCount:result.changed}); await saveLocal(); }
+export async function upsertReviews(reviews=[]){ if(!reviews.length)return; if(pool){for(const r of reviews) await pool.query(`INSERT INTO product_reviews(review_no,product_id,writer,rating,content,created_at,helpful_count) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(review_no) DO UPDATE SET rating=EXCLUDED.rating,content=EXCLUDED.content,helpful_count=EXCLUDED.helpful_count`,[String(r.review_no),String(r.product_no),r.writer??null,r.rating??null,r.content??null,r.created_at??null,r.helpful_count??null]);return;} const d=await getLocal(); const m=new Map(d.reviews.map(r=>[String(r.review_no),r])); reviews.forEach(r=>m.set(String(r.review_no),r)); d.reviews=[...m.values()]; await saveLocal(); }
+export async function upsertProduct(input,runId){ await init(); const ts=now(); const next={...input,active:true,lifecycleStatus:input.soldOut?'sold_out':'active'};
+  if(pool){ const previous=normalize((await pool.query('SELECT * FROM products WHERE id=$1',[next.id])).rows[0]); const event=!previous?'new':priceChanged(previous,next)?'price_changed':previous.soldOut!==next.soldOut?'status_changed':equal(previous,next)?'unchanged':'updated';
+    await pool.query(`INSERT INTO products(id,name,url,image,category,price,list_price,sale_price,sold_out,review_count,rating,description,active,lifecycle_status,last_seen_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,true,$13,NOW(),NOW()) ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name,url=EXCLUDED.url,image=EXCLUDED.image,category=EXCLUDED.category,price=EXCLUDED.price,list_price=EXCLUDED.list_price,sale_price=EXCLUDED.sale_price,sold_out=EXCLUDED.sold_out,review_count=EXCLUDED.review_count,rating=EXCLUDED.rating,description=EXCLUDED.description,active=true,lifecycle_status=EXCLUDED.lifecycle_status,last_seen_at=NOW(),updated_at=CASE WHEN products.price IS DISTINCT FROM EXCLUDED.price OR products.list_price IS DISTINCT FROM EXCLUDED.list_price OR products.sale_price IS DISTINCT FROM EXCLUDED.sale_price OR products.sold_out IS DISTINCT FROM EXCLUDED.sold_out OR products.name IS DISTINCT FROM EXCLUDED.name THEN NOW() ELSE products.updated_at END`,[next.id,next.name,next.url,next.image,next.category,next.salePrice,next.listPrice,next.salePrice,next.soldOut,next.reviewCount,next.rating,next.description,next.lifecycleStatus]);
+    await pool.query(`INSERT INTO product_snapshots(product_id,crawl_run_id,name,category,list_price,sale_price,sold_out,review_count,rating,lifecycle_status) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,[next.id,runId,next.name,next.category,next.listPrice,next.salePrice,next.soldOut,next.reviewCount,next.rating,next.lifecycleStatus]); if(event!=='unchanged')await pool.query(`INSERT INTO product_history(product_id,event_type,before_data,after_data) VALUES($1,$2,$3,$4)`,[next.id,event,previous?JSON.stringify(previous):null,JSON.stringify(next)]); return {event,record:{...next,lastSeenAt:ts}}; }
+  const d=await getLocal(); const i=d.products.findIndex(p=>p.id===next.id); const previous=d.products[i]; const event=!previous?'new':priceChanged(previous,next)?'price_changed':previous.soldOut!==next.soldOut?'status_changed':equal(previous,next)?'unchanged':'updated'; const record={...previous,...next,firstSeenAt:previous?.firstSeenAt??ts,lastSeenAt:ts,updatedAt:event==='unchanged'?previous.updatedAt:ts}; if(i<0)d.products.push(record);else d.products[i]=record; d.snapshots.push({productId:record.id,crawlRunId:runId,observedAt:ts,...record}); if(event!=='unchanged')d.history.unshift({id:`${record.id}-${Date.now()}`,productId:record.id,eventType:event,before:previous??null,after:record,createdAt:ts}); await saveLocal(); return {event,record};
 }
-function same(a, b) {
-  return ['name','price','salePrice','image','category','soldOut','description'].every(k => (a[k] ?? null) === (b[k] ?? null));
-}
-export async function init() {
-  if (!process.env.DATABASE_URL) { await getLocal(); return; }
-  const { Pool } = await import('pg');
-  pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: process.env.DATABASE_URL.includes('localhost') ? false : { rejectUnauthorized: false } });
-  await pool.query(`CREATE TABLE IF NOT EXISTS products (
-    id TEXT PRIMARY KEY, name TEXT NOT NULL, url TEXT NOT NULL, image TEXT, category TEXT,
-    price INTEGER, sale_price INTEGER, sold_out BOOLEAN DEFAULT FALSE, description TEXT,
-    active BOOLEAN DEFAULT TRUE, first_seen_at TIMESTAMPTZ DEFAULT NOW(), last_seen_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW()
-  ); CREATE TABLE IF NOT EXISTS product_history (
-    id BIGSERIAL PRIMARY KEY, product_id TEXT REFERENCES products(id) ON DELETE CASCADE,
-    event_type TEXT NOT NULL, before_data JSONB, after_data JSONB, created_at TIMESTAMPTZ DEFAULT NOW()
-  ); CREATE TABLE IF NOT EXISTS crawl_runs (
-    id BIGSERIAL PRIMARY KEY, started_at TIMESTAMPTZ DEFAULT NOW(), finished_at TIMESTAMPTZ, status TEXT, scanned_count INTEGER DEFAULT 0, new_count INTEGER DEFAULT 0, changed_count INTEGER DEFAULT 0, error_message TEXT
-  );`);
-}
-export async function startRun() {
-  if (pool) return (await pool.query(`INSERT INTO crawl_runs(status) VALUES ('running') RETURNING id`)).rows[0].id;
-  const db = await getLocal(); const run = { id: Date.now(), startedAt: new Date().toISOString(), status: 'running', scannedCount: 0, newCount: 0, changedCount: 0 }; db.runs.unshift(run); await saveLocal(); return run.id;
-}
-export async function endRun(id, result) {
-  if (pool) { await pool.query(`UPDATE crawl_runs SET finished_at=NOW(), status=$2, scanned_count=$3, new_count=$4, changed_count=$5, error_message=$6 WHERE id=$1`, [id, result.status, result.scanned, result.added, result.changed, result.error ?? null]); return; }
-  const db = await getLocal(); const run = db.runs.find(x=>x.id===id); Object.assign(run, { finishedAt:new Date().toISOString(), ...result, scannedCount:result.scanned, newCount:result.added, changedCount:result.changed }); await saveLocal();
-}
-export async function upsertProduct(input) {
-  const now = new Date().toISOString();
-  if (pool) {
-    const previous = (await pool.query('SELECT * FROM products WHERE id=$1', [input.id])).rows[0];
-    const changed = previous && !same({ ...previous, salePrice: previous.sale_price }, input);
-    await pool.query(`INSERT INTO products (id,name,url,image,category,price,sale_price,sold_out,description,active,last_seen_at,updated_at)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,true,NOW(),NOW())
-      ON CONFLICT (id) DO UPDATE SET name=$2,url=$3,image=$4,category=$5,price=$6,sale_price=$7,sold_out=$8,description=$9,active=true,last_seen_at=NOW(),updated_at=CASE WHEN products.name IS DISTINCT FROM $2 OR products.price IS DISTINCT FROM $6 OR products.sale_price IS DISTINCT FROM $7 OR products.sold_out IS DISTINCT FROM $8 THEN NOW() ELSE products.updated_at END`,
-      [input.id,input.name,input.url,input.image,input.category,input.price,input.salePrice,input.soldOut,input.description]);
-    if (!previous || changed) await pool.query(`INSERT INTO product_history(product_id,event_type,before_data,after_data) VALUES($1,$2,$3,$4)`, [input.id, previous ? 'updated' : 'created', previous ? JSON.stringify(previous) : null, JSON.stringify(input)]);
-    return previous ? (changed ? 'changed' : 'unchanged') : 'added';
-  }
-  const db = await getLocal(); const index = db.products.findIndex(x=>x.id===input.id); const previous = db.products[index];
-  const event = !previous ? 'added' : (same(previous,input) ? 'unchanged' : 'changed');
-  const record = { ...previous, ...input, active:true, firstSeenAt:previous?.firstSeenAt ?? now, lastSeenAt:now, updatedAt:event==='changed'||event==='added'?now:previous.updatedAt };
-  if (previous) db.products[index] = record; else db.products.push(record);
-  if (event !== 'unchanged') db.history.unshift({ id:`${input.id}-${Date.now()}`, productId:input.id, eventType:event, before:previous ?? null, after:record, createdAt:now });
-  await saveLocal(); return event;
-}
-export async function markInactive(seenIds) {
-  if (pool) { await pool.query(`UPDATE products SET active=false WHERE active=true AND NOT (id = ANY($1))`, [seenIds]); return; }
-  const db = await getLocal(); db.products.forEach(p=>{ if (!seenIds.includes(p.id)) p.active=false; }); await saveLocal();
-}
-export async function listProducts({ q='', category='', state='' }={}) {
-  if (pool) {
-    const args=[]; let where='WHERE 1=1'; if(q){args.push(`%${q}%`); where += ` AND name ILIKE $${args.length}`;} if(category){args.push(category);where += ` AND category=$${args.length}`;} if(state==='soldout')where+=' AND sold_out=true'; if(state==='available')where+=' AND sold_out=false AND active=true'; if(state==='inactive')where+=' AND active=false';
-    const rows=(await pool.query(`SELECT id,name,url,image,category,price,sale_price AS "salePrice",sold_out AS "soldOut",description,active,first_seen_at AS "firstSeenAt",last_seen_at AS "lastSeenAt",updated_at AS "updatedAt" FROM products ${where} ORDER BY updated_at DESC`,args)).rows; return rows;
-  }
-  const db=await getLocal(); const needle=q.toLowerCase(); return db.products.filter(p=>(!needle||p.name.toLowerCase().includes(needle))&&(!category||p.category===category)&&(!state||(state==='soldout'?p.soldOut:state==='available'?!p.soldOut&&p.active:!p.active))).sort((a,b)=>b.updatedAt.localeCompare(a.updatedAt));
-}
-export async function summary() {
-  if(pool) { const s=(await pool.query(`SELECT COUNT(*)::int AS total, COUNT(*) FILTER (WHERE active AND NOT sold_out)::int AS available, COUNT(*) FILTER (WHERE sold_out)::int AS soldout, MAX(last_seen_at) AS last_seen FROM products`)).rows[0]; const r=(await pool.query(`SELECT id,started_at AS "startedAt",finished_at AS "finishedAt",status,scanned_count AS scanned,"new_count" AS added,changed_count AS changed,error_message AS error FROM crawl_runs ORDER BY id DESC LIMIT 1`)).rows[0]; return {...s, lastRun:r}; }
-  const db=await getLocal(); const active=db.products.filter(p=>p.active); return {total:db.products.length,available:active.filter(p=>!p.soldOut).length,soldout:db.products.filter(p=>p.soldOut).length,last_seen:db.products.map(p=>p.lastSeenAt).sort().at(-1)??null,lastRun:db.runs[0]??null};
-}
-export async function close() { if(pool) await pool.end(); }
+export async function markInactive(seen,runId){ await init(); if(pool){const changed=(await pool.query(`UPDATE products SET active=false,lifecycle_status='deleted',updated_at=NOW() WHERE active=true AND NOT (id=ANY($1)) RETURNING *`,[seen])).rows.map(normalize); for(const p of changed){await pool.query(`INSERT INTO product_history(product_id,event_type,before_data,after_data) VALUES($1,'deleted',$2,$3)`,[p.id,JSON.stringify({...p,active:true}),JSON.stringify(p)]);await pool.query(`INSERT INTO product_snapshots(product_id,crawl_run_id,name,category,list_price,sale_price,sold_out,review_count,rating,lifecycle_status) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'deleted')`,[p.id,runId,p.name,p.category,p.listPrice,p.salePrice,p.soldOut,p.reviewCount,p.rating]);}return changed;}
+ const d=await getLocal(),ts=now(),changed=[];for(const p of d.products)if(p.active&&!seen.includes(p.id)){const before={...p};p.active=false;p.lifecycleStatus='deleted';p.updatedAt=ts;changed.push({...p});d.history.unshift({id:`${p.id}-${Date.now()}`,productId:p.id,eventType:'deleted',before,after:{...p},createdAt:ts});d.snapshots.push({productId:p.id,crawlRunId:runId,observedAt:ts,...p});}await saveLocal();return changed; }
+export async function appendCsvSnapshot(rows){ await fs.mkdir(dataDir,{recursive:true}); let header=true;try{header=(await fs.stat(csvFile)).size===0;}catch{} const columns=['상품번호','상품명','카테고리','판매가','소비자가','할인율','구매평수','평균별점','상태','수집시각'];const lines=rows.map(p=>[p.id,p.name,p.category,p.salePrice,p.listPrice,p.listPrice&&p.salePrice&&p.listPrice>p.salePrice?Math.round((1-p.salePrice/p.listPrice)*100):null,p.reviewCount,p.rating,p.lifecycleStatus??statusOf(p),p.lastSeenAt??now()].map(csv).join(',')).join('\n');await fs.appendFile(csvFile,(header?columns.map(csv).join(',')+'\n':'')+lines+(lines?'\n':''));return csvFile; }
+function matches(p,{q='',category='',state=''}){return(!q||p.name.toLowerCase().includes(q.toLowerCase()))&&(!category||p.category===category)&&(!state||p.lifecycleStatus===state);}
+export async function listProducts(opts={}){await init();const page=Math.max(1,Number(opts.page)||1),pageSize=Math.min(100,Math.max(10,Number(opts.pageSize)||50));if(pool){const args=[],where=[];if(opts.q){args.push('%'+opts.q+'%');where.push(`name ILIKE $${args.length}`);}if(opts.category){args.push(opts.category);where.push(`category=$${args.length}`);}if(opts.state){args.push(opts.state);where.push(`lifecycle_status=$${args.length}`);}const clause=where.length?'WHERE '+where.join(' AND '):'';const total=+(await pool.query(`SELECT COUNT(*)::int n FROM products ${clause}`,args)).rows[0].n;args.push(pageSize,(page-1)*pageSize);const items=(await pool.query(`SELECT id,name,url,image,category,list_price AS "listPrice",sale_price AS "salePrice",review_count AS "reviewCount",rating,sold_out AS "soldOut",description,active,lifecycle_status AS "lifecycleStatus",first_seen_at AS "firstSeenAt",last_seen_at AS "lastSeenAt",updated_at AS "updatedAt" FROM products ${clause} ORDER BY updated_at DESC,id DESC LIMIT $${args.length-1} OFFSET $${args.length}`,args)).rows.map(normalize);return{items,total,page,pageSize};}const d=await getLocal();const all=d.products.filter(p=>matches(p,opts)).sort((a,b)=>b.updatedAt.localeCompare(a.updatedAt)||b.id.localeCompare(a.id));return{items:all.slice((page-1)*pageSize,page*pageSize),total:all.length,page,pageSize};}
+export async function summary(){await init();if(pool){const s=(await pool.query(`SELECT COUNT(*)::int total,COUNT(*) FILTER(WHERE lifecycle_status='active')::int available,COUNT(*) FILTER(WHERE lifecycle_status='sold_out')::int soldout,COUNT(*) FILTER(WHERE lifecycle_status='deleted')::int deleted,MAX(last_seen_at) AS "lastSeen" FROM products`)).rows[0];const r=(await pool.query(`SELECT id,started_at AS "startedAt",finished_at AS "finishedAt",status,scanned_count AS scanned,new_count AS added,changed_count AS changed,error_message AS error,trigger FROM crawl_runs ORDER BY id DESC LIMIT 1`)).rows[0];return{...s,lastRun:r};}const d=await getLocal(),ps=d.products;return{total:ps.length,available:ps.filter(p=>p.lifecycleStatus==='active').length,soldout:ps.filter(p=>p.lifecycleStatus==='sold_out').length,deleted:ps.filter(p=>p.lifecycleStatus==='deleted').length,lastSeen:ps.map(p=>p.lastSeenAt).sort().at(-1)??null,lastRun:d.runs[0]??null};}
+export async function analytics(productId){await init();if(pool){const [categories,discounts,movers,history]=await Promise.all([pool.query(`SELECT category,ROUND(AVG(sale_price))::int AS value FROM products WHERE lifecycle_status='active' AND sale_price IS NOT NULL GROUP BY category ORDER BY value DESC`),pool.query(`SELECT id,name,category,list_price AS "listPrice",sale_price AS "salePrice",ROUND((1-sale_price::numeric/NULLIF(list_price,0))*100)::int AS discount FROM products WHERE list_price>sale_price AND lifecycle_status='active' ORDER BY discount DESC,sale_price LIMIT 10`),pool.query(`WITH r AS (SELECT product_id,MIN(sale_price) min_price,MAX(sale_price) max_price FROM product_snapshots GROUP BY product_id) SELECT p.id,p.name,p.category,r.min_price AS "minPrice",r.max_price AS "maxPrice",ABS(r.max_price-r.min_price) AS change FROM r JOIN products p ON p.id=r.product_id WHERE r.max_price<>r.min_price ORDER BY change DESC LIMIT 10`),productId?pool.query(`SELECT observed_at AS at,sale_price AS "salePrice",list_price AS "listPrice",rating,review_count AS "reviewCount",lifecycle_status AS status FROM product_snapshots WHERE product_id=$1 ORDER BY observed_at`,[productId]):Promise.resolve({rows:[]})]);return{categories:categories.rows,discounts:discounts.rows,movers:movers.rows,history:history.rows};}const d=await getLocal(),active=d.products.filter(p=>p.lifecycleStatus==='active'),by=new Map();for(const p of active){if(p.salePrice!=null){const v=by.get(p.category)||[];v.push(p.salePrice);by.set(p.category,v);}}const categories=[...by].map(([category,v])=>({category,value:Math.round(v.reduce((a,b)=>a+b,0)/v.length)})).sort((a,b)=>b.value-a.value);const discounts=active.filter(p=>p.listPrice>p.salePrice).map(p=>({...p,discount:Math.round((1-p.salePrice/p.listPrice)*100)})).sort((a,b)=>b.discount-a.discount).slice(0,10);const grouped=new Map();for(const s of d.snapshots){const a=grouped.get(s.productId)||[];a.push(s);grouped.set(s.productId,a);}const movers=[...grouped].map(([id,a])=>{const v=a.map(x=>x.salePrice).filter(Number.isFinite);const p=d.products.find(x=>x.id===id);return p&&v.length?{id,name:p.name,category:p.category,minPrice:Math.min(...v),maxPrice:Math.max(...v),change:Math.max(...v)-Math.min(...v)}:null;}).filter(x=>x?.change).sort((a,b)=>b.change-a.change).slice(0,10);return{categories,discounts,movers,history:productId?(grouped.get(productId)||[]).map(s=>({at:s.observedAt,salePrice:s.salePrice,listPrice:s.listPrice,rating:s.rating,reviewCount:s.reviewCount,status:s.lifecycleStatus})):[]};}
+export async function close(){if(pool){await pool.end();pool=undefined;}}
+export async function readProductCsv(){try{return await fs.readFile(csvFile,'utf8');}catch{return '상품번호,상품명,카테고리,판매가,소비자가,할인율,구매평수,평균별점,상태,수집시각\n';}}
