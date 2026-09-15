@@ -1,5 +1,5 @@
 import { json,isAdmin,body,cronAuthorized } from './http.js';
-import { init,listProducts,summary,analytics,readProductCsv } from './store.js';
+import { init,listProducts,summary,analytics,readProductCsv,leaderTrends } from './store.js';
 import { collect } from './collector.js';
 let activeCollection;
 async function runCollection(trigger){if(!activeCollection)activeCollection=collect({trigger}).finally(()=>{activeCollection=undefined;});return activeCollection;}
@@ -11,6 +11,7 @@ export default async function handler(request,response){const url=new URL(reques
  if(route==='/api/products'){await init();return json(response,200,await listProducts({q:url.searchParams.get('q')??'',category:url.searchParams.get('category')??'',state:url.searchParams.get('state')??'',page:url.searchParams.get('page')??1,pageSize:url.searchParams.get('pageSize')??50}));}
  if(route==='/api/summary'){await init();return json(response,200,{...(await summary()),collecting:Boolean(activeCollection)});}
  if(route==='/api/analytics'){await init();return json(response,200,await analytics(url.searchParams.get('productId')??undefined));}
+ if(route==='/api/trends'){return json(response,200,await leaderTrends());}
  if(route==='/api/export/products.csv'){const content=await readProductCsv();response.statusCode=200;response.setHeader('content-type','text/csv; charset=utf-8');response.setHeader('content-disposition','attachment; filename="product.csv"');return response.end('\uFEFF'+content);}
  return json(response,404,{error:'Not found'});
                                                        }
