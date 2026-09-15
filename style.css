@@ -2,4 +2,4 @@
 
 #price-chart svg{height:360px;padding:12px;background:#fbfbfe}
 
-button.collecting{background:#f59e0b;border-color:#f59e0b;animation:collectPulse 1s ease-in-out infinite}button.completed{background:#16a34a;border-color:#16a34a}@keyframes collectPulse{50%{transform:scale(1.03);box-shadow:0 0 0 6px rgba(245,158,11,.18)}}
+button.collecting,button.collecting:disabled{opacity:1;background:#f59e0b;border-color:#f59e0b;cursor:wait;animation:collectPulse 1s ease-in-out infinite}button.completed{background:#16a34a;border-color:#16a34a}@keyframes collectPulse{50%{transform:scale(1.03);box-shadow:0 0 0 6px rgba(245,158,11,.18)}}
